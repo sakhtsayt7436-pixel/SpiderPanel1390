@@ -1633,6 +1633,11 @@ async def startup():
     # default inbound/config. If the platform has not exposed a domain yet,
     # the background resolver keeps retrying until one becomes available.
     await _discover_public_endpoint()
+    # Linux VPS mode: public-IP fallback, system tuning, embedded TLS on 443.
+    try:
+        await _vps_startup()
+    except Exception as _vps_exc:
+        logger.warning("VPS mode startup failed: %s", _vps_exc)
     # Built-in Web Proxy inbound: created once on a fresh install, adopted in
     # place on an existing one. Must run AFTER load_state() and BEFORE the
     # inbound block below (it takes INBOUNDS_LOCK itself).
@@ -2252,6 +2257,10 @@ async def _worker_auto_sync_loop():
 @app.on_event("shutdown")
 async def shutdown():
     global BOT_SCHEDULER_TASK, BOT_POLL_TASK
+    try:
+        await _vps_shutdown()
+    except Exception:
+        pass
     for _task_name in ("BOT_SCHEDULER_TASK", "BOT_POLL_TASK"):
         _task = globals().get(_task_name)
         if _task and not _task.done():
@@ -3416,6 +3425,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
                   f"&host={quote(panel_domain)}&path={quote(tpath, safe='')}&sni={quote(panel_domain)}"
                   "&fp=chrome&alpn=http/1.1")
         tun_rem = quote(f"Spider-{username} Tunnel".strip())
+        params = _vps_tls_params(params)
         return f"vless://{config_uuid}@{panel_domain}:443?{params}#{tun_rem}"
 
     # The managed TLS+WS relay and proxy inbounds can share a configurable
@@ -3496,6 +3506,8 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
                   f"&fp={_ws_fingerprint(is_tls_ws_default_or_proxy)}&alpn=http/1.1")
     if is_default_tls_ws_inbound(inbound) or bool((inbound or {}).get("proxy_managed")):
         params += _default_tls_ws_feature_params()
+    if host == addr_ip or tls_host == panel_domain:
+        params = _vps_tls_params(params)
     return f"vless://{config_uuid}@{_url_authority_host(host)}:{port}?{params}#{remark}"
 
 
@@ -17290,5 +17302,482 @@ async def bot_channel_run(_=Depends(require_auth)):
 # (removed dead proxy-ips endpoints — proxy source is now the daily GitHub list)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LINUX VPS MODE
+#
+# On Railway/Render the platform terminates TLS on 443 and forwards to :8080.
+# On a plain VPS nothing listens on 443, so every generated TLS+WS config
+# (`vless://…@host:443?security=tls&type=ws`) could never connect or "ping".
+#
+# This block makes the panel self-sufficient on a Linux VPS:
+#   1. Learns the public IP when no domain is known (so configs can be built).
+#   2. Runs an embedded TLS listener on 443 serving the SAME app (no nginx).
+#        cert order: SPIDER_TLS_CERT/KEY → Let's Encrypt for the domain →
+#                    DATA_DIR/tls/{fullchain,privkey}.pem → auto self-signed
+#      Self-signed certs add allowInsecure=1 to the generated links.
+#   3. Applies kernel/socket tuning (BBR+fq, backlog, fd limit), best effort.
+#   4. Opens 443/tcp in ufw/firewalld if active, best effort.
+#   5. Self-tests the listener and exposes /api/vps/status.
+#
+# Env switches: SPIDER_VPS_MODE=0|1, SPIDER_TLS_ENABLE=0|1, SPIDER_TLS_PORT,
+#   SPIDER_TLS_CERT, SPIDER_TLS_KEY, SPIDER_TUNE_SYSTEM=0, SPIDER_AUTO_FIREWALL=0
+# ══════════════════════════════════════════════════════════════════════════════
+import contextlib as _contextlib
+import ssl as _ssl
+
+_PLATFORM_ENV_MARKERS = (
+    "RAILWAY_PUBLIC_DOMAIN", "RAILWAY_STATIC_URL", "RAILWAY_ENVIRONMENT",
+    "RENDER", "RENDER_EXTERNAL_URL", "KOYEB_PUBLIC_DOMAIN", "REPLIT_DEV_DOMAIN",
+    "DYNO", "VERCEL", "FLY_APP_NAME",
+)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _vps_mode_enabled() -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    default = not any(os.environ.get(k) for k in _PLATFORM_ENV_MARKERS)
+    return _env_flag("SPIDER_VPS_MODE", default)
+
+
+VPS_STATE: dict = {
+    "mode": False,
+    "public_ip": "",
+    "tuning": {},
+    "firewall": "",
+    "tls": {
+        "enabled": False, "running": False, "port": 443, "self_signed": False,
+        "cert": "", "key": "", "host": "", "error": "", "selftest": "",
+    },
+}
+_VPS_TLS_SERVER = None
+_VPS_TLS_TASK = None
+_VPS_TLS_MANAGER_TASK = None
+_VPS_TLS_SIGNATURE = None
+
+
+class _EmbeddedTLSServer(uvicorn.Server):
+    """uvicorn Server that must never touch the primary server's signals."""
+
+    def install_signal_handlers(self):  # uvicorn < 0.29
+        return None
+
+    @_contextlib.contextmanager
+    def capture_signals(self):  # uvicorn >= 0.29
+        yield
+
+
+# ── 1. public IP ──────────────────────────────────────────────────────────────
+def _vps_detect_public_ip_sync() -> str:
+    import urllib.request
+
+    for url in ("https://api.ipify.org", "https://icanhazip.com",
+                "https://ifconfig.me/ip", "https://digitalresistance.dog/myIp"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "SpiderPanel"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                ip = r.read(64).decode("utf-8", "ignore").strip()
+            if _is_public_host(ip):
+                return ip
+        except Exception:
+            continue
+    return ""
+
+
+async def _vps_ensure_public_endpoint() -> None:
+    """If no domain/endpoint is known yet, fall back to this VPS's public IP."""
+    if get_host():
+        return
+    ip = await asyncio.get_running_loop().run_in_executor(None, _vps_detect_public_ip_sync)
+    if not ip:
+        logger.warning("VPS mode: could not detect public IP; set SPIDER_PANEL_PUBLIC_DOMAIN")
+        return
+    VPS_STATE["public_ip"] = ip
+    endpoint = _normalize_public_endpoint(ip)
+    if endpoint and not get_host():
+        _apply_public_endpoint(endpoint, "vps:public-ip")
+        logger.info("VPS mode: using public IP %s as endpoint (set a domain for real TLS)", ip)
+        asyncio.create_task(save_state())
+
+
+# ── 2. system tuning ──────────────────────────────────────────────────────────
+def _vps_write_proc(path: str, value: str) -> bool:
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+        return True
+    except Exception:
+        return False
+
+
+def _vps_tune_system() -> dict:
+    out: dict = {}
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = hard if hard != resource.RLIM_INFINITY else 1048576
+        target = min(target, 1048576)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        out["nofile"] = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except Exception as exc:
+        out["nofile"] = f"skipped: {exc}"
+
+    if not _env_flag("SPIDER_TUNE_SYSTEM", True) or os.geteuid() != 0:
+        out["sysctl"] = "skipped (not root or disabled)"
+        return out
+
+    applied = []
+    cc_path = "/proc/sys/net/ipv4/tcp_available_congestion_control"
+    try:
+        avail = Path(cc_path).read_text().split()
+        if "bbr" not in avail:
+            subprocess.run(["modprobe", "tcp_bbr"], timeout=5,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            avail = Path(cc_path).read_text().split()
+        if "bbr" in avail:
+            if _vps_write_proc("/proc/sys/net/core/default_qdisc", "fq"):
+                applied.append("qdisc=fq")
+            if _vps_write_proc("/proc/sys/net/ipv4/tcp_congestion_control", "bbr"):
+                applied.append("cc=bbr")
+    except Exception:
+        pass
+    for path, value, label in (
+        ("/proc/sys/net/core/somaxconn", "4096", "somaxconn=4096"),
+        ("/proc/sys/net/ipv4/tcp_max_syn_backlog", "4096", "syn_backlog=4096"),
+        ("/proc/sys/net/ipv4/tcp_fastopen", "3", "fastopen=3"),
+        ("/proc/sys/net/ipv4/tcp_slow_start_after_idle", "0", "no_slow_start_after_idle"),
+        ("/proc/sys/net/ipv4/tcp_mtu_probing", "1", "mtu_probing"),
+        ("/proc/sys/net/ipv4/tcp_keepalive_time", "120", "keepalive=120"),
+        ("/proc/sys/net/core/rmem_max", "16777216", "rmem_max=16M"),
+        ("/proc/sys/net/core/wmem_max", "16777216", "wmem_max=16M"),
+    ):
+        if _vps_write_proc(path, value):
+            applied.append(label)
+    out["sysctl"] = applied or "read-only (container?)"
+    return out
+
+
+def _vps_open_firewall(port: int) -> str:
+    """Open `port`/tcp in an *active* ufw/firewalld. Never enables a firewall."""
+    if os.geteuid() != 0 or not _env_flag("SPIDER_AUTO_FIREWALL", True):
+        return "skipped"
+    try:
+        if shutil.which("ufw"):
+            st = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=8)
+            if "inactive" not in st.stdout.lower():
+                subprocess.run(["ufw", "allow", f"{port}/tcp"], timeout=10,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return f"ufw allow {port}/tcp"
+        if shutil.which("firewall-cmd"):
+            st = subprocess.run(["firewall-cmd", "--state"], capture_output=True, text=True, timeout=8)
+            if "running" in st.stdout.lower():
+                subprocess.run(["firewall-cmd", "--permanent", f"--add-port={port}/tcp"],
+                               timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["firewall-cmd", "--reload"], timeout=10,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return f"firewalld add-port {port}/tcp"
+    except Exception as exc:
+        return f"failed: {exc}"
+    return "no active firewall"
+
+
+# ── 3. TLS certificate ────────────────────────────────────────────────────────
+def _vps_tls_dir() -> Path:
+    for base in (DATA_DIR, Path(tempfile.gettempdir()) / "spider-data"):
+        try:
+            d = Path(base) / "tls"
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except Exception:
+            continue
+    return Path(tempfile.gettempdir())
+
+
+def _vps_generate_self_signed(host: str, cert_path: Path, key_path: Path) -> None:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host or "spider")])
+    try:
+        san = x509.IPAddress(ipaddress.ip_address(host))
+    except ValueError:
+        san = x509.DNSName(host or "spider")
+    now = datetime.utcnow()
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName([san]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()))
+    os.chmod(key_path, 0o600)
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+
+def _vps_resolve_cert(host: str) -> tuple[str, str, bool]:
+    """Return (cert_path, key_path, self_signed)."""
+    env_c = str(os.environ.get("SPIDER_TLS_CERT") or "").strip()
+    env_k = str(os.environ.get("SPIDER_TLS_KEY") or "").strip()
+    if env_c and env_k and Path(env_c).is_file() and Path(env_k).is_file():
+        return env_c, env_k, False
+
+    if host:
+        le = Path("/etc/letsencrypt/live") / host
+        if (le / "fullchain.pem").is_file() and (le / "privkey.pem").is_file():
+            return str(le / "fullchain.pem"), str(le / "privkey.pem"), False
+
+    d = _vps_tls_dir()
+    if (d / "fullchain.pem").is_file() and (d / "privkey.pem").is_file():
+        return str(d / "fullchain.pem"), str(d / "privkey.pem"), False
+
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", host or "spider")
+    cert_p, key_p = d / f"selfsigned-{safe}.crt", d / f"selfsigned-{safe}.key"
+    if not (cert_p.is_file() and key_p.is_file()):
+        _vps_generate_self_signed(host, cert_p, key_p)
+        logger.info("VPS mode: generated self-signed certificate for %s", host)
+    return str(cert_p), str(key_p), True
+
+
+def vps_tls_self_signed_active() -> bool:
+    t = VPS_STATE["tls"]
+    return bool(t.get("running") and t.get("self_signed"))
+
+
+def _vps_tls_params(params: str) -> str:
+    """Make client TLS params accept our self-signed cert (otherwise no ping)."""
+    if not vps_tls_self_signed_active():
+        return params
+    params = params.replace("allowInsecure=0", "allowInsecure=1").replace("insecure=0", "insecure=1")
+    if "allowInsecure=" not in params:
+        params += "&allowInsecure=1"
+    return params
+
+
+# ── 4. embedded TLS listener ──────────────────────────────────────────────────
+def _vps_port_free(port: int) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+async def _vps_run_server(server) -> None:
+    try:
+        await server.serve()
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:  # uvicorn calls sys.exit(1) on bind failure
+        VPS_STATE["tls"]["error"] = f"TLS listener stopped: {exc!r}"
+        logger.warning("VPS TLS listener stopped: %r", exc)
+    finally:
+        VPS_STATE["tls"]["running"] = False
+
+
+async def _vps_stop_tls() -> None:
+    global _VPS_TLS_SERVER, _VPS_TLS_TASK
+    if _VPS_TLS_SERVER is not None:
+        _VPS_TLS_SERVER.should_exit = True
+    if _VPS_TLS_TASK is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(_VPS_TLS_TASK), timeout=5)
+        except Exception:
+            _VPS_TLS_TASK.cancel()
+    _VPS_TLS_SERVER = _VPS_TLS_TASK = None
+    VPS_STATE["tls"]["running"] = False
+
+
+async def _vps_selftest() -> str:
+    t = VPS_STATE["tls"]
+    host = t.get("host") or "localhost"
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    try:
+        sni = None if _is_ip_literal(host) else host
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", t["port"], ssl=ctx, server_hostname=sni), 5)
+        writer.write(b"GET /healthz HTTP/1.1\r\nHost: %b\r\nConnection: close\r\n\r\n" % host.encode())
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(256), 5)
+        writer.close()
+        result = "ok" if b" 200 " in data.split(b"\r\n", 1)[0] else f"bad response: {data[:60]!r}"
+    except Exception as exc:
+        result = f"failed: {exc!r}"
+    t["selftest"] = result
+    return result
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(str(host).strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _vps_xray_uses_port(port: int) -> bool:
+    """True when a configured Xray (Reality) inbound listens on `port`."""
+    try:
+        for ib in INBOUNDS.values():
+            proto = str(ib.get("protocol") or "").lower()
+            sec = str(ib.get("security") or "").lower()
+            if proto != "reality" and sec != "reality":
+                continue
+            if not str(ib.get("external_port") or "").strip():
+                continue  # not configured -> Xray does not run it
+            if int(str(ib.get("port") or 0) or 0) == int(port):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _vps_start_tls(host: str) -> None:
+    global _VPS_TLS_SERVER, _VPS_TLS_TASK
+    t = VPS_STATE["tls"]
+    port = int(t["port"])
+    if _vps_xray_uses_port(port):
+        t.update(error=f"port {port} is used by an Xray Reality inbound; "
+                       "set SPIDER_TLS_PORT to another port or move the Reality listen port",
+                 running=False)
+        logger.warning("VPS TLS: %s", t["error"])
+        return
+    try:
+        cert, key, self_signed = await asyncio.get_running_loop().run_in_executor(
+            None, _vps_resolve_cert, host)
+    except Exception as exc:
+        t.update(error=f"certificate error: {exc}", running=False)
+        logger.warning("VPS TLS: certificate error: %s", exc)
+        return
+
+    if not _vps_port_free(port):
+        t.update(error=f"port {port} is already in use (another TLS proxy such as nginx/caddy?)",
+                 running=False)
+        logger.info("VPS TLS: port %d busy - assuming an external TLS proxy handles it", port)
+        return
+
+    config = uvicorn.Config(
+        app, host="0.0.0.0", port=port, ssl_certfile=cert, ssl_keyfile=key,
+        log_level="warning", access_log=False, lifespan="off", proxy_headers=False,
+        backlog=4096, timeout_keep_alive=75, ws_ping_interval=20, ws_ping_timeout=30,
+    )
+    _VPS_TLS_SERVER = _EmbeddedTLSServer(config)
+    _VPS_TLS_TASK = asyncio.create_task(_vps_run_server(_VPS_TLS_SERVER), name="spider-vps-tls")
+
+    for _ in range(40):  # wait up to 4s for the socket to come up
+        await asyncio.sleep(0.1)
+        if getattr(_VPS_TLS_SERVER, "started", False):
+            break
+        if _VPS_TLS_TASK.done():
+            break
+    started = bool(getattr(_VPS_TLS_SERVER, "started", False)) and not _VPS_TLS_TASK.done()
+    t.update(cert=cert, key=key, self_signed=self_signed, host=host, running=started,
+             error="" if started else (t.get("error") or "TLS listener failed to start"))
+    if started:
+        res = await _vps_selftest()
+        logger.info("VPS TLS listener on :%d (%s cert, host=%s) selftest=%s",
+                    port, "self-signed" if self_signed else "trusted", host, res)
+        VPS_STATE["firewall"] = await asyncio.get_running_loop().run_in_executor(
+            None, _vps_open_firewall, port)
+
+
+def _vps_tls_signature(host: str):
+    try:
+        cert, key, ss = _vps_resolve_cert(host)
+        return (host, cert, ss, Path(cert).stat().st_mtime, Path(key).stat().st_mtime)
+    except Exception:
+        return (host, None)
+
+
+async def _vps_tls_manager_loop() -> None:
+    """(Re)start the TLS listener when the host or certificate files change."""
+    global _VPS_TLS_SIGNATURE
+    while True:
+        try:
+            host = get_host()
+            if host:
+                sig = await asyncio.get_running_loop().run_in_executor(
+                    None, _vps_tls_signature, host)
+                if sig != _VPS_TLS_SIGNATURE or (
+                        not VPS_STATE["tls"]["running"] and VPS_STATE["tls"]["enabled"]
+                        and "already in use" not in VPS_STATE["tls"]["error"]
+                        and _VPS_TLS_TASK is None):
+                    await _vps_stop_tls()
+                    _VPS_TLS_SIGNATURE = sig
+                    await _vps_start_tls(host)
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("VPS TLS manager error: %s", exc)
+            await asyncio.sleep(30)
+
+
+async def _vps_startup() -> None:
+    """Called from the app startup hook after the first endpoint discovery."""
+    global _VPS_TLS_MANAGER_TASK
+    VPS_STATE["mode"] = _vps_mode_enabled()
+    if not VPS_STATE["mode"]:
+        return
+    loop = asyncio.get_running_loop()
+    VPS_STATE["tuning"] = await loop.run_in_executor(None, _vps_tune_system)
+    await _vps_ensure_public_endpoint()
+    try:
+        port = int(os.environ.get("SPIDER_TLS_PORT") or 443)
+    except ValueError:
+        port = 443
+    VPS_STATE["tls"]["port"] = port
+    VPS_STATE["tls"]["enabled"] = _env_flag("SPIDER_TLS_ENABLE", True)
+    if VPS_STATE["tls"]["enabled"]:
+        _VPS_TLS_MANAGER_TASK = asyncio.create_task(_vps_tls_manager_loop(), name="spider-vps-tls-manager")
+    logger.info("VPS mode ON: tuning=%s", VPS_STATE["tuning"])
+
+
+async def _vps_shutdown() -> None:
+    global _VPS_TLS_MANAGER_TASK
+    if _VPS_TLS_MANAGER_TASK is not None:
+        _VPS_TLS_MANAGER_TASK.cancel()
+        _VPS_TLS_MANAGER_TASK = None
+    await _vps_stop_tls()
+
+
+@app.get("/api/vps/status")
+async def vps_status(_=Depends(require_auth)):
+    return {**VPS_STATE, "host": get_host()}
+
+
+@app.post("/api/vps/selftest")
+async def vps_selftest_endpoint(_=Depends(require_auth)):
+    if not VPS_STATE["tls"]["running"]:
+        return {"ok": False, "detail": VPS_STATE["tls"]["error"] or "TLS listener not running"}
+    res = await _vps_selftest()
+    return {"ok": res == "ok", "detail": res}
+
+
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
+    uvicorn.run(
+        "main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1,
+        backlog=4096, timeout_keep_alive=75,
+    )
